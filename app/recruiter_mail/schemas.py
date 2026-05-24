@@ -1,12 +1,11 @@
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
 
 
 class EmailScanRequest(BaseModel):
-    access_token: str           # Google OAuth token from frontend
+    access_token: str
     days_back: int = 30
-    max_emails: int = 50
+    max_emails: int = 20
 
 
 class RecruiterEmailResponse(BaseModel):
@@ -26,4 +25,18 @@ class RecruiterEmailResponse(BaseModel):
 
 
 class StatusUpdate(BaseModel):
-    status: str                 # unread | replied | archived
+    status: str  # unread | replied | archived
+
+
+class SendReplyRequest(BaseModel):
+    access_token: str       # Google OAuth token
+    gmail_id: str           # original email thread id to reply to
+    body: str               # reply text
+    subject: Optional[str]  # optional — auto-prefixed with Re: if not given
+    to: str                 # recipient email address
+
+
+class SendReplyResponse(BaseModel):
+    sent: bool
+    gmail_message_id: Optional[str]
+    message: str
