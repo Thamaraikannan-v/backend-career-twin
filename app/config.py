@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
 
     # LLM routing: "auto" | "groq" | "gemini"
-    llm_provider: str = "auto"
+    llm_provider: str = "groq"
 
     # Supabase
     supabase_url: str = ""
@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
     stripe_pro_price_id: str = ""
+
+    # Hunter.io (email finder — free 25 searches/month)
+    hunter_api_key: str = ""
 
     # App
     app_env: str = "development"
@@ -54,3 +57,5 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+# Note: add these two lines inside the Settings class before the @property methods

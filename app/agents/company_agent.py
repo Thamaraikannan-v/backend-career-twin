@@ -12,17 +12,18 @@ You are a recruitment intelligence analyst.
 Based on the search results below, produce a hiring intelligence report for a job candidate.
 
 COMPANY: {company_name}
+JOB TITLE: {job_title}
 ROLE LEVEL: {seniority_level}
 
 LIVE SEARCH RESULTS:
 {search_results}
 
 Using the search results above, provide:
-1. Engineering culture — what it is actually like to work there
+1. Culture — what it is actually like to work there
 2. Interview process — rounds, style, difficulty, what they test
-3. Compensation — estimated base salary range for a {seniority_level} engineer
+3. Compensation — estimated base salary range for a {seniority_level} {job_title}
 4. Hiring signals — actively hiring, on freeze, or expanding?
-5. Engineering reputation
+5. Reputation
 6. Work-life balance signals
 7. Remote / hybrid / onsite policy
 
@@ -30,7 +31,7 @@ Return ONLY valid JSON:
 {{
   "culture_summary": "<3-4 sentences of honest culture assessment>",
   "interview_style": "<what to expect in interviews>",
-  "compensation_range": "<estimated range>",
+  "compensation_range": "<estimated range> only lpa",
   "hiring_signals": "<actively hiring, on freeze, or expanding?>",
   "red_flags": ["concern1"],
   "green_flags": ["positive1"],
@@ -47,14 +48,15 @@ You are a recruitment intelligence analyst.
 Use your training knowledge to produce a hiring intelligence report for this company.
 
 COMPANY: {company_name}
+JOB TITLE: {job_title}
 ROLE LEVEL: {seniority_level}
 
 Provide your best knowledge on:
-1. Engineering culture
+1. Culture
 2. Interview process
-3. Compensation estimates
+3. Compensation estimates for {seniority_level} {job_title}
 4. Hiring signals
-5. Engineering reputation
+5. Reputation
 6. Work-life balance
 7. Remote policy
 
@@ -62,7 +64,7 @@ Return ONLY valid JSON:
 {{
   "culture_summary": "<3-4 sentences>",
   "interview_style": "<what to expect>",
-  "compensation_range": "<estimated range>",
+  "compensation_range": "<estimated range> only lpa",
   "hiring_signals": "<hiring status>",
   "red_flags": ["concern1"],
   "green_flags": ["positive1"],
@@ -74,7 +76,7 @@ Return ONLY valid JSON:
 """
 
 
-async def _tavily_search(company_name: str) -> str:
+async def _tavily_search(company_name: str, job_title: str, seniority: str) -> str:
     """
     Search Tavily for company intel.
     Returns a formatted string of results to inject into the prompt.
@@ -85,9 +87,9 @@ async def _tavily_search(company_name: str) -> str:
         raise ValueError("TAVILY_API_KEY not set")
 
     queries = [
-        f"{company_name} engineering culture glassdoor review 2024 2025",
-        f"{company_name} software engineer interview process",
-        f"{company_name} software engineer salary levels.fyi compensation",
+        f"{company_name} {job_title} culture glassdoor review 2024 2025",
+        f"{company_name} {job_title} interview process",
+        f"{company_name} {job_title} salary levels.fyi compensation",
         f"{company_name} hiring layoffs news 2025",
     ]
 
@@ -134,13 +136,16 @@ async def run(state: dict) -> dict:
 
     company_name = state["company_name"]
     seniority = "senior"
+    job_title = "engineer"  # fallback
+    
     if state.get("jd_signals"):
         seniority = state["jd_signals"].get("seniority_level", "senior")
+        job_title = state["jd_signals"].get("job_title", "engineer")
 
     # ── Step 1: Try Tavily search ─────────────────────────────────────────────
     search_results = None
     try:
-        search_results = await _tavily_search(company_name)
+        search_results = await _tavily_search(company_name, job_title, seniority)
         log.info("tavily_search_done", company=company_name, chars=len(search_results))
     except Exception as e:
         log.warning("tavily_failed_using_llm_knowledge", error=str(e))
@@ -149,12 +154,14 @@ async def run(state: dict) -> dict:
     if search_results:
         prompt = PROMPT.format(
             company_name=company_name,
+            job_title=job_title,
             seniority_level=seniority,
             search_results=search_results,
         )
     else:
         prompt = FALLBACK_PROMPT.format(
             company_name=company_name,
+            job_title=job_title,
             seniority_level=seniority,
         )
 

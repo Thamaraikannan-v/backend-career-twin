@@ -30,6 +30,7 @@ create table if not exists public.analyses (
   company_name         text,
   jd_text              text,
   resume_url           text,
+  resume_text          text,
 
   candidate_profile    jsonb,
   jd_signals           jsonb,

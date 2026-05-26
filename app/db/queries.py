@@ -117,7 +117,7 @@ async def set_resume_text(analysis_id: str, resume_text: str) -> None:
 async def get_latest_resume_metadata(user_id: str) -> dict | None:
     """
     Fetch metadata (char_count, created_at) of the latest saved resume.
-    Calculates char_count from resume_text length since DB column doesn't exist yet.
+    Calculates char_count from resume_text length.
     Returns dict with resume_char_count and created_at, or None if no resume found.
     """
     try:

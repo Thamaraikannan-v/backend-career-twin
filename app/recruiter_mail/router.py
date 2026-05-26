@@ -3,6 +3,7 @@ from app.recruiter_mail import service
 from app.recruiter_mail.schemas import (
     EmailScanRequest,
     RecruiterEmailResponse,
+    ReplyDraftsResponse,
     StatusUpdate,
     SendReplyRequest,
     SendReplyResponse,
@@ -22,6 +23,7 @@ async def scan_emails(
     Trigger Gmail scan in background.
     Frontend passes Google OAuth access_token from Supabase session.
     Returns immediately — poll GET /api/recruiter-mail/ for results.
+    Reply drafts are NOT generated here; use POST /{email_id}/drafts on demand.
     """
     background_tasks.add_task(
         service.scan_gmail_and_analyse,
@@ -40,6 +42,26 @@ async def scan_emails(
 async def list_emails(user: AuthUser = Depends(get_current_user)):
     """All detected recruiter emails for this user, newest first."""
     return await service.get_recruiter_emails(user.id)
+
+
+@router.post("/{email_id}/drafts", response_model=ReplyDraftsResponse)
+async def generate_drafts(
+    email_id: str,
+    user: AuthUser = Depends(get_current_user),
+):
+    """
+    Generate reply drafts for a single email on demand.
+    Called when the user clicks "Generate Replies" in the frontend.
+    Drafts are persisted to Supabase so subsequent GET / returns them.
+    Returns 400 for no-reply/automated senders, 404 if email not found.
+    """
+    try:
+        drafts = await service.generate_reply_drafts(email_id, user.id)
+        return ReplyDraftsResponse(drafts=drafts)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate drafts: {e}")
 
 
 @router.patch("/{email_id}/status")
