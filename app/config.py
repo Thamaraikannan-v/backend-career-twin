@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # Hunter.io (email finder — free 25 searches/month)
     hunter_api_key: str = ""
 
+    # Exa (semantic job search)
+    exa_api_key: str = ""
+
+
     # App
     app_env: str = "development"
     cors_origins: str = (
