@@ -104,6 +104,44 @@ async def set_resume_url(analysis_id: str, resume_url: str) -> None:
         log.error("set_resume_url_failed", error=str(e))
 
 
+async def set_resume_text(analysis_id: str, resume_text: str) -> None:
+    """Store parsed resume text for later retrieval."""
+    try:
+        get_db().table("analyses").update(
+            {"resume_text": resume_text}
+        ).eq("id", analysis_id).execute()
+    except Exception as e:
+        log.error("set_resume_text_failed", error=str(e))
+
+
+async def get_latest_resume_metadata(user_id: str) -> dict | None:
+    """
+    Fetch metadata (char_count, created_at) of the latest saved resume.
+    Calculates char_count from resume_text length.
+    Returns dict with resume_char_count and created_at, or None if no resume found.
+    """
+    try:
+        result = (
+            get_db().table("analyses")
+            .select("resume_text, created_at")
+            .eq("user_id", user_id)
+            .not_.is_("resume_text", "null")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if result and result.data and len(result.data) > 0:
+            row = result.data[0]
+            return {
+                "resume_char_count": len(row.get("resume_text", "")),
+                "created_at": row.get("created_at"),
+            }
+        return None
+    except Exception as e:
+        log.error("get_latest_resume_metadata_failed", error=str(e))
+        return None
+
+
 # ── Subscription queries ─────────────────────────────────────────────────────
 
 async def get_subscription(user_id: str) -> dict | None:
@@ -143,3 +181,19 @@ async def is_pro(user_id: str) -> bool:
         return sub is not None and sub.get("status") == "pro"
     except Exception:
         return False  # safe fallback — treat as free tier
+
+
+# ── Resume queries ──────────────────────────────────────────────────────────
+
+async def get_latest_resume(user_id: str) -> dict | None:
+    """
+    Fetch the most recently uploaded resume for a user.
+    Returns dict with resume_url and parsed_text, or None if no resume found.
+    """
+    return _safe_single(
+        get_db().table("analyses")
+        .select("resume_url, resume_text")
+        .eq("user_id", user_id)
+        .not_.is_("resume_text", "null")
+        .order("created_at", desc=True)
+    )

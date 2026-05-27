@@ -5,7 +5,7 @@ from typing import Optional
 class EmailScanRequest(BaseModel):
     access_token: str
     days_back: int = 30
-    max_emails: int = 20
+    max_emails: int = 30
 
 
 class RecruiterEmailResponse(BaseModel):
@@ -22,6 +22,15 @@ class RecruiterEmailResponse(BaseModel):
     summary: Optional[str]
     reply_drafts: Optional[list]
     status: str
+
+
+class ReplyDraft(BaseModel):
+    tone: str   # professional | friendly | brief
+    body: str
+
+
+class ReplyDraftsResponse(BaseModel):
+    drafts: list[ReplyDraft]
 
 
 class StatusUpdate(BaseModel):

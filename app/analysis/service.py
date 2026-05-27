@@ -12,11 +12,17 @@ async def start_analysis(
     user_id:      str,
     company_name: str,
     jd_text:      str,
-    file_bytes:   bytes,
-) -> str:
+    file_bytes:   bytes | None = None,
+    resume_text:  str | None = None,
+) -> tuple[str, str]:
     """
     Validates free tier, creates DB row, parses PDF, stores file.
-    Returns analysis_id immediately so the frontend can start polling.
+    Returns (analysis_id, resume_text) tuple.
+    
+    If file_bytes is provided, parses and uploads it.
+    Otherwise, if resume_text is provided, uses it directly (pre-parsed).
+    If neither is provided, raises error.
+    
     The graph runs in a background task — see router.py.
     """
     # Free tier check (skip if user is Pro)
@@ -26,8 +32,16 @@ async def start_analysis(
         if count >= get_settings().free_tier_limit:
             raise FreeTierLimitError()
 
-    # Parse PDF first — fail fast before creating DB row
-    parsed = parse_pdf(file_bytes)
+    # Determine resume text source
+    if file_bytes:
+        # Parse PDF first — fail fast before creating DB row
+        parsed = parse_pdf(file_bytes)
+        text = parsed["text"]
+    elif resume_text:
+        # Use pre-parsed resume text
+        text = resume_text
+    else:
+        raise ValueError("Either file_bytes or resume_text must be provided")
 
     # Create DB row with status=running
     analysis_id = await db.create_analysis(
@@ -36,12 +50,16 @@ async def start_analysis(
         jd_text=jd_text,
     )
 
-    # Upload PDF to Supabase Storage (non-fatal if it fails)
-    resume_url = await upload_to_storage(user_id, analysis_id, file_bytes)
-    if resume_url:
-        await db.set_resume_url(analysis_id, resume_url)
+    # Store parsed resume text for later retrieval
+    await db.set_resume_text(analysis_id, text)
 
-    return analysis_id, parsed["text"]
+    # Upload PDF to Supabase Storage only if file_bytes provided (non-fatal if it fails)
+    if file_bytes:
+        resume_url = await upload_to_storage(user_id, analysis_id, file_bytes)
+        if resume_url:
+            await db.set_resume_url(analysis_id, resume_url)
+
+    return analysis_id, text
 
 
 async def run_graph_and_persist(
@@ -108,3 +126,13 @@ async def get_analysis(analysis_id: str, user_id: str) -> dict:
 
 async def list_analyses(user_id: str) -> list[dict]:
     return await db.list_analyses(user_id)
+
+
+async def get_latest_resume_for_user(user_id: str) -> dict | None:
+    """Fetch the latest saved resume for a user."""
+    return await db.get_latest_resume(user_id)
+
+
+async def get_latest_resume_metadata_for_user(user_id: str) -> dict | None:
+    """Fetch metadata (char_count, created_at) of latest saved resume."""
+    return await db.get_latest_resume_metadata(user_id)
