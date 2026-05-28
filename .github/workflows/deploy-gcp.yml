@@ -12,8 +12,8 @@ on:
 env:
   REGISTRY: gcr.io
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  GCP_REGION: us-central1
-  SERVICE_NAME: career-twin-backend
+  GCP_REGION: europe-west1
+  SERVICE_NAME: backend-carniq
 
 jobs:
   build-and-deploy:
