@@ -1,4 +1,4 @@
-from app.core.gemini import call_model, extract_json
+from app.core.models import call_model, extract_json
 import structlog
 
 log = structlog.get_logger()

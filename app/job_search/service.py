@@ -7,7 +7,7 @@ import structlog
 from openai import OpenAI
 
 from app.config import get_settings
-from app.core.gemini import call_model, extract_json
+from app.core.models import call_model, extract_json
 from app.db.client import get_db
 
 log = structlog.get_logger()

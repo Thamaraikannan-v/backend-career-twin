@@ -1,11 +1,3 @@
-"""
-Unified LLM client — supports Gemini and Groq, switchable via LLM_PROVIDER in .env.
-
-LLM_PROVIDER=groq    → Groq for everything (recommended)
-LLM_PROVIDER=gemini  → Gemini for everything
-LLM_PROVIDER=auto    → Groq (same as groq, search is handled by Tavily in company_agent)
-"""
-import google.generativeai as genai
 from app.config import get_settings
 import json
 import re
@@ -62,17 +54,45 @@ async def _call_groq(prompt: str) -> str:
                 raise
 
 
-def extract_json(text: str) -> dict:
-    """Robustly extract JSON from model output — handles fences and prose."""
+def extract_json(text: str) -> dict | list:
+    """Robustly extract JSON from model output — handles fences, objects, arrays, and concatenated arrays."""
     text = re.sub(r"```json\s*", "", text)
     text = re.sub(r"```\s*", "", text)
+    text = text.strip()
 
+    # Try parsing as-is first
     try:
-        return json.loads(text.strip())
+        return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    # If multiple JSON arrays are concatenated, find and merge them all
+    merged = []
+    decoder = json.JSONDecoder()
+    pos = 0
+    found_any = False
+    while pos < len(text):
+        # Skip whitespace
+        while pos < len(text) and text[pos] in " \t\n\r":
+            pos += 1
+        if pos >= len(text):
+            break
+        try:
+            obj, end_pos = decoder.raw_decode(text, pos)
+            found_any = True
+            if isinstance(obj, list):
+                merged.extend(obj)
+            elif isinstance(obj, dict):
+                merged.append(obj)
+            pos = end_pos
+        except json.JSONDecodeError:
+            pos += 1
+
+    if found_any and merged:
+        return merged
+
+    # Last resort — find first {...} or [...]
+    match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group())

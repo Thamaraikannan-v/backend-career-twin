@@ -2,7 +2,7 @@
 
 import os
 from openai import OpenAI
-from app.core.gemini import call_model, extract_json
+from app.core.models import call_model, extract_json
 from app.config import get_settings
 import structlog
 
