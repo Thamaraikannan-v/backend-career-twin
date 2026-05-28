@@ -1,3 +1,4 @@
+import asyncio
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Optional, Any
 from app.agents import (
@@ -8,13 +9,12 @@ from app.agents import (
     rewrite_agent,
     baseline_agent,
 )
-import asyncio
 import structlog
 
 log = structlog.get_logger()
 
 
-# ── State ────────────────────────────────────────────────────────────────────
+# ── State ─────────────────────────────────────────────────────────────────────
 
 class AnalysisState(TypedDict, total=False):
     # Inputs
@@ -40,64 +40,104 @@ class AnalysisState(TypedDict, total=False):
 # ── Node wrappers ─────────────────────────────────────────────────────────────
 
 async def node_resume(state: AnalysisState) -> dict:
-    return await resume_agent.run(state)
+    try:
+        return await resume_agent.run(state)
+    except Exception as e:
+        log.error("resume_agent_failed", error=str(e))
+        return {"candidate_profile": {}, "error": str(e)}
 
 
 async def node_jd(state: AnalysisState) -> dict:
-    return await jd_agent.run(state)
+    if not state.get("candidate_profile"):
+        log.warning("jd_skipped_no_resume_profile")
+        return {"jd_signals": {}}
+    try:
+        return await jd_agent.run(state)
+    except Exception as e:
+        log.error("jd_agent_failed", error=str(e))
+        return {"jd_signals": {}}
 
 
 async def node_parallel_research(state: AnalysisState) -> dict:
     """
-    Runs company_agent (LLM + Google Search) and baseline_agent (pure Python)
-    concurrently using asyncio.gather — saves ~20-30s vs sequential.
+    Runs company_agent (MCP search) and baseline_agent (embeddings)
+    concurrently. Times out after 45s so a slow MCP call never blocks forever.
     """
     log.info("parallel_research_start")
-    company_result, baseline_result = await asyncio.gather(
-        company_agent.run(state),
-        baseline_agent.run(state),
-    )
+    try:
+        company_result, baseline_result = await asyncio.wait_for(
+            asyncio.gather(
+                company_agent.run(state),
+                baseline_agent.run(state),
+            ),
+            timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        log.warning("parallel_research_timeout")
+        company_result  = {"company_intel": {}}
+        baseline_result = {"baseline_score": 0.0, "keyword_analysis": {}}
+    except Exception as e:
+        log.error("parallel_research_failed", error=str(e))
+        company_result  = {"company_intel": {}}
+        baseline_result = {"baseline_score": 0.0, "keyword_analysis": {}}
+
     return {**company_result, **baseline_result}
 
 
-async def node_recruiter(state: AnalysisState) -> dict:
-    return await recruiter_agent.run(state)
+async def node_recruiter_and_rewrite(state: AnalysisState) -> dict:
+    """
+    recruiter_sim and rewrite have no dependency on each other —
+    run them concurrently to save ~2-4s.
+    """
+    log.info("recruiter_and_rewrite_start")
+    try:
+        recruiter_result, rewrite_result = await asyncio.wait_for(
+            asyncio.gather(
+                recruiter_agent.run(state),
+                rewrite_agent.run(state),
+            ),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        log.warning("recruiter_and_rewrite_timeout")
+        recruiter_result = {"recruiter_simulation": {}}
+        rewrite_result   = {"resume_rewrite": {}}
+    except Exception as e:
+        log.error("recruiter_and_rewrite_failed", error=str(e))
+        recruiter_result = {"recruiter_simulation": {}}
+        rewrite_result   = {"resume_rewrite": {}}
+
+    return {**recruiter_result, **rewrite_result}
 
 
-async def node_rewrite(state: AnalysisState) -> dict:
-    return await rewrite_agent.run(state)
-
-
-# ── Graph ────────────────────────────────────────────────────────────────────
+# ── Graph ─────────────────────────────────────────────────────────────────────
 
 def build_graph() -> StateGraph:
     """
     Pipeline:
       resume_intel
         → jd_intel
-          → parallel_research  (company + baseline concurrently)
-            → recruiter_sim
-              → rewrite
+          → parallel_research   (company + baseline concurrently)
+            → recruiter_and_rewrite  (recruiter_sim + rewrite concurrently)
     """
     g = StateGraph(AnalysisState)
 
-    g.add_node("resume_intel",      node_resume)
-    g.add_node("jd_intel",          node_jd)
-    g.add_node("parallel_research", node_parallel_research)
-    g.add_node("recruiter_sim",     node_recruiter)
-    g.add_node("rewrite",           node_rewrite)
+    g.add_node("resume_intel",          node_resume)
+    g.add_node("jd_intel",              node_jd)
+    g.add_node("parallel_research",     node_parallel_research)
+    g.add_node("recruiter_and_rewrite", node_recruiter_and_rewrite)
 
     g.set_entry_point("resume_intel")
-    g.add_edge("resume_intel",      "jd_intel")
-    g.add_edge("jd_intel",          "parallel_research")
-    g.add_edge("parallel_research", "recruiter_sim")
-    g.add_edge("recruiter_sim",     "rewrite")
-    g.add_edge("rewrite",           END)
+    g.add_edge("resume_intel",          "jd_intel")
+    g.add_edge("jd_intel",              "parallel_research")
+    g.add_edge("parallel_research",     "recruiter_and_rewrite")
+    g.add_edge("recruiter_and_rewrite", END)
 
     return g.compile()
 
 
-# Singleton — compile once at startup via lifespan
+# ── Singleton — compiled once at startup ─────────────────────────────────────
+
 _graph = None
 
 

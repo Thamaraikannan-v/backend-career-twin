@@ -1,8 +1,9 @@
-import httpx
+import asyncio
 import re
 from email.mime.text import MIMEText
 import base64
-from app.core.gemini import call_model, extract_json
+from openai import OpenAI
+from app.core.models import call_model, extract_json
 from app.db.client import get_db
 from app.config import get_settings
 from uuid import uuid4
@@ -10,15 +11,29 @@ import structlog
 
 log = structlog.get_logger()
 
-TAVILY_URL  = "https://api.tavily.com/search"
-HUNTER_URL  = "https://api.hunter.io/v2"
-GMAIL_API   = "https://gmail.googleapis.com/gmail/v1/users/me"
+GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
+
+
+# ── Groq + Exa MCP client ─────────────────────────────────────────────────────
+
+def _get_groq_mcp_client() -> OpenAI:
+    return OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=get_settings().groq_api_key,
+    )
+
+def _get_exa_mcp_tool() -> dict:
+    return {
+        "type": "mcp",
+        "server_url": f"https://mcp.exa.ai/mcp?exaApiKey={get_settings().exa_api_key}",
+        "server_label": "exa",
+        "require_approval": "never",
+    }
 
 
 # ── Step 1: DB cache check ────────────────────────────────────────────────────
 
 async def get_cached_contacts(company_name: str) -> dict | None:
-    """Return cached emails if we already searched this company before."""
     try:
         result = (
             get_db().table("company_contacts")
@@ -28,11 +43,10 @@ async def get_cached_contacts(company_name: str) -> dict | None:
             .execute()
         )
         data = result.data
-        if data and len(data) > 0:
-            # Bump search count
-            get_db().table("company_contacts")\
-                .update({"search_count": data[0]["search_count"] + 1})\
-                .eq("id", data[0]["id"])\
+        if data:
+            get_db().table("company_contacts") \
+                .update({"search_count": data[0]["search_count"] + 1}) \
+                .eq("id", data[0]["id"]) \
                 .execute()
             log.info("contacts_from_cache", company=company_name)
             return data[0]
@@ -43,235 +57,108 @@ async def get_cached_contacts(company_name: str) -> dict | None:
 
 
 async def save_contacts_to_cache(company_name: str, domain: str, emails: list[dict]) -> None:
-    """Save found emails to DB for future users."""
     try:
         normalized = company_name.strip().lower()
-        # Check if already exists first
-        existing = get_db().table("company_contacts")            .select("id")            .ilike("company_name", normalized)            .limit(1)            .execute()
-
-        if existing.data and len(existing.data) > 0:
-            # Update existing record
-            get_db().table("company_contacts")                .update({"domain": domain, "emails": emails})                .eq("id", existing.data[0]["id"])                .execute()
+        existing = (
+            get_db().table("company_contacts")
+            .select("id")
+            .ilike("company_name", normalized)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            get_db().table("company_contacts") \
+                .update({"domain": domain, "emails": emails}) \
+                .eq("id", existing.data[0]["id"]) \
+                .execute()
         else:
-            # Insert new record
             get_db().table("company_contacts").insert({
-                "id":           str(uuid4()),
+                "id": str(uuid4()),
                 "company_name": company_name.strip(),
-                "domain":       domain,
-                "emails":       emails,
+                "domain": domain,
+                "emails": emails,
             }).execute()
         log.info("contacts_cached", company=company_name, count=len(emails))
     except Exception as e:
         log.warning("cache_save_failed", error=str(e))
 
 
-# ── Step 2: Find company domain ───────────────────────────────────────────────
+# ── Step 2: Find domain + emails via Exa MCP (single call) ───────────────────
 
-# Domains to skip — job boards, aggregators, social networks
-SKIP_DOMAINS = {
-    "linkedin.com", "in.linkedin.com", "glassdoor.com", "indeed.com",
-    "crunchbase.com", "wikipedia.org", "bloomberg.com", "twitter.com",
-    "facebook.com", "instagram.com", "youtube.com", "ambitionbox.com",
-    "naukri.com", "monster.com", "shine.com", "timesjobs.com",
-    "google.com", "bing.com", "yahoo.com",
-}
+CONTACT_SEARCH_PROMPT = """
+Find the official website domain AND recruiter/HR contact emails for this company.
+
+COMPANY: {company_name}
+ROLE: {role_title}
+
+Instructions:
+1. First find the official company website (NOT LinkedIn, Glassdoor, Indeed, ZoomInfo, Crunchbase)
+2. Then find real recruiter or HR email addresses for this company
+3. Search for: "{company_name} recruiter HR email careers contact"
+4. Search the company's own careers page for contact emails
+5. Only return emails that belong to the company's own domain
+
+Return ONLY valid JSON:
+{{
+  "domain": "example.com",
+  "emails": [
+    {{
+      "email": "recruiter@example.com",
+      "type": "recruiter | hr | careers | generic",
+      "confidence": <50-95>,
+      "source": "exa"
+    }}
+  ]
+}}
+
+If no real emails found, return empty list for emails but still return the domain.
+Never return emails from ZoomInfo, LinkedIn, Glassdoor, or any third-party site.
+"""
 
 
-async def _find_domain_via_tavily(company_name: str) -> str | None:
+async def _find_contacts_via_mcp(company_name: str, role_title: str) -> dict:
     """
-    Search Tavily to find the company official domain.
-    Skips job boards, LinkedIn, and aggregators.
-    Tries multiple queries to get the real company site.
+    Single Exa MCP call to find both domain and recruiter emails.
+    Returns {"domain": str, "emails": list[dict]}
     """
-    settings = get_settings()
-    if not settings.tavily_api_key:
-        return None
-
-    # Multiple queries — first hit on a non-skip domain wins
-    queries = [
-        f"{company_name} official website",
-        f"{company_name} company homepage careers",
-        f"{company_name} Inc official site",
-    ]
+    def _call() -> str:
+        client = _get_groq_mcp_client()
+        response = client.responses.create(
+            model="openai/gpt-oss-120b",
+            input=CONTACT_SEARCH_PROMPT.format(
+                company_name=company_name,
+                role_title=role_title,
+            ),
+            tools=[_get_exa_mcp_tool()],
+            temperature=0.1,
+            top_p=0.4,
+        )
+        return response.output_text or ""
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            for query in queries:
-                try:
-                    resp = await client.post(
-                        TAVILY_URL,
-                        json={
-                            "api_key":      settings.tavily_api_key,
-                            "query":        query,
-                            "search_depth": "basic",
-                            "max_results":  5,
-                            "include_answer": True,
-                        },
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
+        raw = await asyncio.to_thread(_call)
+        log.info("mcp_contact_search_done", company=company_name, chars=len(raw))
+        data = extract_json(raw)
+        domain = data.get("domain", "")
+        emails = data.get("emails", [])
 
-                    for result in data.get("results", []):
-                        url = result.get("url", "")
-                        match = re.search(
-                            r"https?://(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", url
-                        )
-                        if not match:
-                            continue
-                        domain = match.group(1).lower()
+        # Safety filter — reject any email not on company domain
+        if domain:
+            emails = [e for e in emails if domain in e.get("email", "")]
 
-                        # Strip subdomains like in.linkedin.com → linkedin.com
-                        parts = domain.split(".")
-                        if len(parts) > 2:
-                            root = ".".join(parts[-2:])
-                        else:
-                            root = domain
-
-                        if root in SKIP_DOMAINS or domain in SKIP_DOMAINS:
-                            continue
-
-                        log.info("domain_found", company=company_name, domain=domain)
-                        return domain
-                except Exception:
-                    continue
-    except Exception as e:
-        log.warning("domain_search_failed", error=str(e))
-    return None
-
-
-# ── Step 3a: Hunter.io email finder ──────────────────────────────────────────
-
-async def _search_hunter(domain: str, role_title: str) -> list[dict]:
-    """
-    Use Hunter.io domain search to find recruiter/HR emails.
-    Free tier: 25 searches/month.
-    """
-    settings = get_settings()
-    if not settings.hunter_api_key:
-        log.warning("hunter_api_key_not_set")
-        return []
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(
-                f"{HUNTER_URL}/domain-search",
-                params={
-                    "domain":   domain,
-                    "api_key":  settings.hunter_api_key,
-                    "type":     "personal",
-                    "limit":    10,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            emails = []
-            for entry in data.get("data", {}).get("emails", []):
-                email = entry.get("value", "")
-                if not email:
-                    continue
-
-                # Prioritise HR/recruiting roles
-                position = (entry.get("position") or "").lower()
-                dept      = (entry.get("department") or "").lower()
-                is_hr     = any(k in position + dept for k in
-                                ["recruit", "hr", "talent", "hiring", "people"])
-
-                emails.append({
-                    "email":      email,
-                    "type":       "recruiter" if is_hr else "generic",
-                    "confidence": entry.get("confidence", 50),
-                    "source":     "hunter",
-                })
-
-            # Sort by HR relevance first, then confidence
-            emails.sort(key=lambda x: (x["type"] == "recruiter", x["confidence"]), reverse=True)
-            log.info("hunter_results", domain=domain, count=len(emails))
-            return emails[:5]
+        log.info("mcp_contacts_found", company=company_name,
+                 domain=domain, count=len(emails))
+        return {"domain": domain, "emails": emails}
 
     except Exception as e:
-        log.warning("hunter_search_failed", error=str(e))
-        return []
+        log.error("mcp_contact_search_failed", error=str(e))
+        return {"domain": "", "emails": []}
 
 
-# ── Step 3b: Tavily email search fallback ─────────────────────────────────────
-
-async def _search_emails_via_tavily(company_name: str, domain: str) -> list[dict]:
-    """
-    Fallback when Hunter.io finds nothing.
-    Searches for publicly listed HR/careers emails.
-    """
-    settings = get_settings()
-    if not settings.tavily_api_key:
-        return []
-
-    queries = [
-        f"{company_name} recruiter HR email contact careers",
-        f"site:{domain} careers email recruiting contact",
-        f"{company_name} talent acquisition email address",
-    ]
-
-    found_emails = set()
-    results = []
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            for query in queries:
-                try:
-                    resp = await client.post(
-                        TAVILY_URL,
-                        json={
-                            "api_key":      settings.tavily_api_key,
-                            "query":        query,
-                            "search_depth": "basic",
-                            "max_results":  3,
-                            "include_answer": True,
-                        },
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-
-                    # Extract emails from snippets using regex
-                    text = data.get("answer", "") + " ".join(
-                        r.get("content", "") for r in data.get("results", [])
-                    )
-                    emails_found = re.findall(
-                        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text
-                    )
-                    for email in emails_found:
-                        email = email.lower()
-                        if email in found_emails:
-                            continue
-                        if domain and domain not in email:
-                            continue    # only keep emails from company domain
-                        found_emails.add(email)
-
-                        email_type = "generic"
-                        if any(k in email for k in ["recruit", "hr", "talent", "hiring", "career", "jobs"]):
-                            email_type = "careers"
-
-                        results.append({
-                            "email":      email,
-                            "type":       email_type,
-                            "confidence": 70 if email_type == "careers" else 50,
-                            "source":     "tavily",
-                        })
-                except Exception:
-                    continue
-    except Exception as e:
-        log.warning("tavily_email_search_failed", error=str(e))
-
-    log.info("tavily_email_results", company=company_name, count=len(results))
-    return results[:5]
-
-
-# ── Step 3c: Generic fallback emails ─────────────────────────────────────────
+# ── Step 3: Generic fallback emails ──────────────────────────────────────────
 
 def _generic_fallback_emails(domain: str) -> list[dict]:
-    """
-    If all else fails, return common HR email patterns for the domain.
-    Low confidence but better than nothing.
-    """
+    """Last resort — common HR email patterns for the domain."""
     if not domain:
         return []
     patterns = [
@@ -291,58 +178,45 @@ def _generic_fallback_emails(domain: str) -> list[dict]:
 
 async def find_contacts(company_name: str, role_title: str) -> dict:
     """
-    Full pipeline:
+    Pipeline:
     1. Check DB cache
-    2. Find domain via Tavily
-    3. Search Hunter.io for emails
-    4. Fallback to Tavily email search
-    5. Fallback to generic patterns
-    6. Cache results
+    2. Exa MCP — find domain + emails in one call
+    3. Fallback to generic patterns if nothing found
+    4. Cache results
     """
     # 1. Cache check
     cached = await get_cached_contacts(company_name)
     if cached:
         return {
             "company_name": company_name,
-            "domain":       cached.get("domain"),
-            "emails":       cached.get("emails", []),
-            "from_cache":   True,
+            "domain": cached.get("domain"),
+            "emails": cached.get("emails", []),
+            "from_cache": True,
         }
 
-    # 2. Find domain
-    domain = await _find_domain_via_tavily(company_name) or ""
+    # 2. Exa MCP search
+    result = await _find_contacts_via_mcp(company_name, role_title)
+    domain = result["domain"]
+    emails = result["emails"]
 
-    # 3. Hunter.io
-    emails = await _search_hunter(domain, role_title) if domain else []
-
-    # 4. Tavily fallback
-    if len(emails) < 2:
-        tavily_emails = await _search_emails_via_tavily(company_name, domain)
-        # Merge, avoiding duplicates
-        existing = {e["email"] for e in emails}
-        for e in tavily_emails:
-            if e["email"] not in existing:
-                emails.append(e)
-                existing.add(e["email"])
-
-    # 5. Generic pattern fallback
+    # 3. Generic fallback if MCP found nothing
     if not emails and domain:
         emails = _generic_fallback_emails(domain)
 
     # Sort by confidence
-    emails.sort(key=lambda x: x["confidence"], reverse=True)
+    emails.sort(key=lambda x: x.get("confidence", 0), reverse=True)
 
-    # 6. Cache for future users
-    if emails:
+    # 4. Cache
+    if domain or emails:
         await save_contacts_to_cache(company_name, domain, emails)
 
     log.info("find_contacts_done",
              company=company_name, domain=domain, count=len(emails))
     return {
         "company_name": company_name,
-        "domain":       domain,
-        "emails":       emails,
-        "from_cache":   False,
+        "domain": domain,
+        "emails": emails,
+        "from_cache": False,
     }
 
 
@@ -386,15 +260,12 @@ Return ONLY valid JSON:
   ]
 }}
 
-direct    → straight to the point, confident, no fluff
-story     → opens with a relevant achievement or moment
+direct     → straight to the point, confident, no fluff
+story      → opens with a relevant achievement or moment
 value-prop → leads with what the candidate can do for the company
 """
 
-FALLBACK_PROFILE = """
-Experienced software engineer seeking new opportunities.
-Strong technical background with multiple years of experience.
-"""
+FALLBACK_PROFILE = "Experienced software engineer seeking new opportunities."
 
 
 async def generate_cold_email(
@@ -403,10 +274,7 @@ async def generate_cold_email(
     role_title: str,
     analysis_id: str | None,
 ) -> dict:
-    """
-    Generate 3 cold email variants using the candidate's profile from DB.
-    """
-    # Pull candidate profile from most recent analysis if available
+    """Generate 3 cold email variants using the candidate's profile from DB."""
     candidate_profile = FALLBACK_PROFILE
     if analysis_id:
         try:
@@ -431,11 +299,12 @@ async def generate_cold_email(
         )
     )
     data = extract_json(raw)
-    log.info("cold_email_generated", company=company_name, variants=len(data.get("variants", [])))
+    log.info("cold_email_generated",
+             company=company_name, variants=len(data.get("variants", [])))
     return {
-        "variants":     data.get("variants", []),
+        "variants": data.get("variants", []),
         "company_name": company_name,
-        "to_email":     to_email,
+        "to_email": to_email,
     }
 
 
@@ -451,7 +320,7 @@ def _build_raw_email(to: str, subject: str, body: str) -> str:
 def _auth_headers(access_token: str) -> dict:
     return {
         "Authorization": f"Bearer {access_token}",
-        "Content-Type":  "application/json",
+        "Content-Type": "application/json",
     }
 
 
@@ -464,6 +333,7 @@ async def send_cold_email(
     user_id: str,
 ) -> dict:
     """Send the cold email via Gmail and save to cold_emails table."""
+    import httpx
     raw = _build_raw_email(to_email, subject, body)
 
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -477,26 +347,26 @@ async def send_cold_email(
             raise ValueError("Google token expired. User must re-login.")
         if resp.status_code == 403:
             raise ValueError("Gmail send scope not granted.")
-
         if not resp.is_success:
-            log.error("cold_email_send_failed", status=resp.status_code, body=resp.text)
+            log.error("cold_email_send_failed",
+                      status=resp.status_code, body=resp.text)
             resp.raise_for_status()
 
         data = resp.json()
         gmail_msg_id = data.get("id")
-        log.info("cold_email_sent", to=to_email, company=company_name, id=gmail_msg_id)
+        log.info("cold_email_sent",
+                 to=to_email, company=company_name, id=gmail_msg_id)
 
-    # Save to cold_emails table
     try:
         get_db().table("cold_emails").insert({
-            "id":            str(uuid4()),
-            "user_id":       user_id,
-            "company_name":  company_name,
-            "to_email":      to_email,
-            "subject":       subject,
-            "body":          body,
-            "status":        "sent",
-            "gmail_msg_id":  gmail_msg_id,
+            "id": str(uuid4()),
+            "user_id": user_id,
+            "company_name": company_name,
+            "to_email": to_email,
+            "subject": subject,
+            "body": body,
+            "status": "sent",
+            "gmail_msg_id": gmail_msg_id,
         }).execute()
     except Exception as e:
         log.warning("cold_email_save_failed", error=str(e))

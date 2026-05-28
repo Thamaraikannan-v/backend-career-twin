@@ -10,6 +10,8 @@ from app.resume.router  import router as resume_router
 from app.graph.graph    import get_graph
 from app.recruiter_mail.router import router as recruiter_mail_router
 from app.cold_email.router    import router as cold_email_router
+from app.job_search.router import router as job_search_router
+from app.advisor.router import router as advisor_router
 
 
 
@@ -52,6 +54,8 @@ app.include_router(resume_router)
 app.include_router(recruiter_mail_router)  # recruiter_mail router
 app.include_router(cold_email_router)     # cold_email router
 app.include_router(recruiter_mail_router)
+app.include_router(job_search_router)     # job_search router
+app.include_router(advisor_router)        # advisor router
 
 @app.get("/health", tags=["health"])
 async def health():

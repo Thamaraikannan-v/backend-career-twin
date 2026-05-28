@@ -1,11 +1,12 @@
-import httpx
-from app.core.gemini import call_model, extract_json
+# app/agents/company_agent.py
+
+import os
+from openai import OpenAI
+from app.core.models import call_model, extract_json
 from app.config import get_settings
 import structlog
 
 log = structlog.get_logger()
-
-TAVILY_URL = "https://api.tavily.com/search"
 
 PROMPT = """
 You are a recruitment intelligence analyst.
@@ -15,10 +16,7 @@ COMPANY: {company_name}
 JOB TITLE: {job_title}
 ROLE LEVEL: {seniority_level}
 
-LIVE SEARCH RESULTS:
-{search_results}
-
-Using the search results above, provide:
+Using live web search, research and provide:
 1. Culture — what it is actually like to work there
 2. Interview process — rounds, style, difficulty, what they test
 3. Compensation — estimated base salary range for a {seniority_level} {job_title}
@@ -26,6 +24,12 @@ Using the search results above, provide:
 5. Reputation
 6. Work-life balance signals
 7. Remote / hybrid / onsite policy
+
+Search for:
+- "{company_name} {job_title} culture glassdoor review 2024 2025"
+- "{company_name} {job_title} interview process"
+- "{company_name} {job_title} salary levels.fyi compensation"
+- "{company_name} hiring layoffs news 2025"
 
 Return ONLY valid JSON:
 {{
@@ -42,7 +46,6 @@ Return ONLY valid JSON:
 }}
 """
 
-# Fallback prompt when Tavily search fails — uses LLM training knowledge only
 FALLBACK_PROMPT = """
 You are a recruitment intelligence analyst.
 Use your training knowledge to produce a hiring intelligence report for this company.
@@ -76,59 +79,57 @@ Return ONLY valid JSON:
 """
 
 
-async def _tavily_search(company_name: str, job_title: str, seniority: str) -> str:
+def _get_groq_mcp_client() -> OpenAI:
+    """Return an OpenAI-compatible Groq client."""
+    return OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=get_settings().groq_api_key,
+    )
+
+
+async def _search_with_mcp(company_name: str, job_title: str, seniority: str) -> str:
     """
-    Search Tavily for company intel.
-    Returns a formatted string of results to inject into the prompt.
+    Use Groq + Tavily MCP tool to search for company intel in a single call.
+    The model autonomously decides what to search based on the prompt.
+    Returns the model's response text (with search results baked in).
     Raises on failure so caller can fall back.
     """
-    api_key = get_settings().tavily_api_key
-    if not api_key:
+    settings = get_settings()
+    tavily_api_key = settings.tavily_api_key
+    if not tavily_api_key:
         raise ValueError("TAVILY_API_KEY not set")
 
-    queries = [
-        f"{company_name} {job_title} culture glassdoor review 2024 2025",
-        f"{company_name} {job_title} interview process",
-        f"{company_name} {job_title} salary levels.fyi compensation",
-        f"{company_name} hiring layoffs news 2025",
+    client = _get_groq_mcp_client()
+
+    tools = [
+        {
+            "type": "mcp",
+            "server_url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={tavily_api_key}",
+            "server_label": "tavily",
+            "require_approval": "never",
+        }
     ]
 
-    results_text = []
+    prompt = PROMPT.format(
+        company_name=company_name,
+        job_title=job_title,
+        seniority_level=seniority,
+    )
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for query in queries:
-            try:
-                resp = await client.post(
-                    TAVILY_URL,
-                    json={
-                        "api_key": api_key,
-                        "query": query,
-                        "search_depth": "basic",
-                        "max_results": 3,
-                        "include_answer": True,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
+    response = client.responses.create(
+        model="openai/gpt-oss-120b",
+        input=prompt,
+        tools=tools,
+        temperature=0.1,
+        top_p=0.4,
+    )
 
-                # Include Tavily's synthesised answer if present
-                if data.get("answer"):
-                    results_text.append(f"Q: {query}\nA: {data['answer']}")
+    result = response.output_text
+    if not result or not result.strip():
+        raise ValueError("MCP search returned empty response")
 
-                # Include top result snippets
-                for r in data.get("results", [])[:2]:
-                    snippet = r.get("content", "")[:400]
-                    if snippet:
-                        results_text.append(f"Source: {r.get('url','')}\n{snippet}")
-
-            except Exception as e:
-                log.warning("tavily_query_failed", query=query[:50], error=str(e))
-                continue
-
-    if not results_text:
-        raise ValueError("Tavily returned no results")
-
-    return "\n\n---\n\n".join(results_text)
+    log.info("mcp_search_done", company=company_name, chars=len(result))
+    return result
 
 
 async def run(state: dict) -> dict:
@@ -136,42 +137,38 @@ async def run(state: dict) -> dict:
 
     company_name = state["company_name"]
     seniority = "senior"
-    job_title = "engineer"  # fallback
-    
+    job_title = "engineer"
+
     if state.get("jd_signals"):
         seniority = state["jd_signals"].get("seniority_level", "senior")
         job_title = state["jd_signals"].get("job_title", "engineer")
 
-    # ── Step 1: Try Tavily search ─────────────────────────────────────────────
-    search_results = None
+    # ── Step 1: Try MCP-powered search (Groq + Tavily MCP) ───────────────────
+    mcp_result = None
     try:
-        search_results = await _tavily_search(company_name, job_title, seniority)
-        log.info("tavily_search_done", company=company_name, chars=len(search_results))
+        mcp_result = await _search_with_mcp(company_name, job_title, seniority)
     except Exception as e:
-        log.warning("tavily_failed_using_llm_knowledge", error=str(e))
+        log.warning("mcp_search_failed_falling_back", error=str(e))
 
-    # ── Step 2: Build prompt (with or without search results) ─────────────────
-    if search_results:
-        prompt = PROMPT.format(
-            company_name=company_name,
-            job_title=job_title,
-            seniority_level=seniority,
-            search_results=search_results,
-        )
-    else:
-        prompt = FALLBACK_PROMPT.format(
-            company_name=company_name,
-            job_title=job_title,
-            seniority_level=seniority,
-        )
+    # ── Step 2: Extract JSON from MCP result ─────────────────────────────────
+    if mcp_result:
+        try:
+            intel = extract_json(mcp_result)
+            log.info("company_agent_done", company=company_name, source="groq+tavily-mcp")
+            return {"company_intel": intel}
+        except Exception as e:
+            log.warning("mcp_json_extraction_failed_falling_back", error=str(e))
 
-    # ── Step 3: Call LLM (Groq or Gemini based on LLM_PROVIDER) ──────────────
+    # ── Step 3: Fallback — call LLM without search ────────────────────────────
     try:
-        raw = await call_model(prompt, use_search=False)  # search already done by Tavily
+        fallback_prompt = FALLBACK_PROMPT.format(
+            company_name=company_name,
+            job_title=job_title,
+            seniority_level=seniority,
+        )
+        raw = await call_model(fallback_prompt, use_search=False)
         intel = extract_json(raw)
-        log.info("company_agent_done",
-                 company=company_name,
-                 source="tavily+llm" if search_results else "llm-only")
+        log.info("company_agent_done", company=company_name, source="llm-only-fallback")
         return {"company_intel": intel}
 
     except Exception as e:

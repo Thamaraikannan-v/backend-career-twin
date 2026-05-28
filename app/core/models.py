@@ -1,0 +1,103 @@
+from app.config import get_settings
+import json
+import re
+import time
+import structlog
+
+log = structlog.get_logger()
+
+_gemini_configured = False
+_groq_client = None
+
+
+def _get_groq():
+    global _groq_client
+    if _groq_client is None:
+        try:
+            from groq import Groq
+            _groq_client = Groq(api_key=get_settings().groq_api_key)
+        except ImportError:
+            raise RuntimeError("groq package not installed. Run: pip install groq")
+    return _groq_client
+
+
+
+async def call_model(prompt: str, use_search: bool = False) -> str:
+    """
+    Route to the correct provider based on LLM_PROVIDER env var.
+    use_search param is ignored — web search is handled by Tavily in company_agent.
+    """
+    provider = get_settings().llm_provider.lower()
+
+    return await _call_groq(prompt)
+
+
+
+async def _call_groq(prompt: str) -> str:
+    client = _get_groq()
+    settings = get_settings()
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=settings.groq_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=4096,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            if ("rate" in str(e).lower() or "429" in str(e)) and attempt < 2:
+                wait = 10 * (attempt + 1)
+                log.warning("groq_rate_limit", attempt=attempt + 1, wait_secs=wait)
+                time.sleep(wait)
+            else:
+                raise
+
+
+def extract_json(text: str) -> dict | list:
+    """Robustly extract JSON from model output — handles fences, objects, arrays, and concatenated arrays."""
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```\s*", "", text)
+    text = text.strip()
+
+    # Try parsing as-is first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # If multiple JSON arrays are concatenated, find and merge them all
+    merged = []
+    decoder = json.JSONDecoder()
+    pos = 0
+    found_any = False
+    while pos < len(text):
+        # Skip whitespace
+        while pos < len(text) and text[pos] in " \t\n\r":
+            pos += 1
+        if pos >= len(text):
+            break
+        try:
+            obj, end_pos = decoder.raw_decode(text, pos)
+            found_any = True
+            if isinstance(obj, list):
+                merged.extend(obj)
+            elif isinstance(obj, dict):
+                merged.append(obj)
+            pos = end_pos
+        except json.JSONDecodeError:
+            pos += 1
+
+    if found_any and merged:
+        return merged
+
+    # Last resort — find first {...} or [...]
+    match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError as e:
+            log.error("json_extraction_failed", error=str(e), snippet=text[:300])
+            raise ValueError(f"Could not extract valid JSON: {e}")
+
+    raise ValueError("No JSON object found in model output")
